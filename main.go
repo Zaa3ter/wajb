@@ -2,75 +2,33 @@ package main
 
 import (
 	"bufio"
-	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
-
-type task struct {
-	id          string
-	title       string
-	done        bool
-	priority    int
-	tags        []string
-	description string
-}
-
-func (t *task) generateID() {
-	// Nanosecond timestamp hex-encoded (~16 chars)
-	ts := time.Now().UnixNano()
-
-	// Crypto-random string prefix/suffix
-	b := make([]byte, 4)
-	rand.Read(b)
-	t.id = fmt.Sprintf("%x-%x", ts, b)
-}
-
-func (t task) save(dirPath string) error {
-	if t.id == "" {
-		t.generateID()
-	}
-	taskDir := path.Join(dirPath, t.id)
-
-	if err := os.MkdirAll(taskDir, 0755); err != nil {
-		return err
-	}
-
-	filePath := path.Join(taskDir, "TASK.md")
-
-	fd, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer fd.Close()
-
-	status := "OPEN"
-	if t.done {
-		status = "CLOSE"
-	}
-	tags := strings.Join(t.tags, " ,")
-
-	_, err = fmt.Fprintf(fd, "# %s\n\n- STATUS: %s\n- PRIORITY: %d\n- TAGS: %s\n\n%s", t.title, status, t.priority, tags, t.description)
-	return err
-}
 
 func main() {
 	if len(os.Args) > 1 {
-		if os.Args[1] == "new" {
+		switch os.Args[1] {
+		case "n", "new":
 			t, err := newTask()
 			if err != nil {
 				panic(err)
 			}
 			rootPath, _ := getRootDir()
 			t.save(rootPath)
+		case "l", "list":
+			if err := listTask(); err != nil {
+				panic(err)
+			}
 		}
+	} else {
+		startTUI()
 	}
-	listTask()
 }
 
 func newTask() (*task, error) {
@@ -84,6 +42,10 @@ func newTask() (*task, error) {
 		return nil, err
 	}
 	t.title = strings.TrimSpace(title)
+
+	fmt.Print("tags (split by space): ")
+	tagsStr, err := reader.ReadString('\n')
+	t.tags = strings.Split(tagsStr, " ")
 
 	fmt.Print("description: ")
 	var lines []string
@@ -115,19 +77,18 @@ func newTask() (*task, error) {
 	return &t, nil
 }
 
-func listTask() {
+func getTask() ([]*task, error) {
 	rootPath, err := getRootDir()
 	if err != nil {
-		fmt.Println("error:", err)
-		return
+		return nil, err
 	}
 
 	entries, err := os.ReadDir(rootPath)
 	if err != nil {
-		fmt.Println("error:", err)
-		return
+		return nil, err
 	}
 
+	var tasks []*task
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -136,15 +97,27 @@ func listTask() {
 		if err != nil {
 			continue
 		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
 
+func listTask() error {
+	tasks, err := getTask()
+	if err != nil {
+		return err
+	}
+
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].priority > tasks[j].priority })
+	for _, t := range tasks {
 		status := "OPEN"
 		if !t.done {
 			status = "CLOSE"
 		}
 		tags := strings.Join(t.tags, ",")
-
 		fmt.Printf("%s\t[%s]\t%d\t%s\t%s\n", t.id, status, t.priority, t.title, tags)
 	}
+	return nil
 }
 
 func loadTask(rootPath, id string) (*task, error) {
@@ -158,15 +131,21 @@ func loadTask(rootPath, id string) (*task, error) {
 	t := &task{id: id}
 	scanner := bufio.NewScanner(fd)
 
+	inbody := false
+	var bodyLines []string
 	for scanner.Scan() {
 		line := scanner.Text()
+		if inbody {
+			bodyLines = append(bodyLines, line)
+			continue
+		}
 
 		switch {
 		case strings.HasPrefix(line, "# "):
 			t.title = strings.TrimSpace(strings.TrimPrefix(line, "# "))
 		case strings.HasPrefix(line, "- STATUS:"):
 			v := strings.TrimSpace(strings.TrimPrefix(line, "- STATUS:"))
-			t.done = v == "OPEN"
+			t.done = v == "CLOSE"
 		case strings.HasPrefix(line, "- PRIORITY:"):
 			v := strings.TrimSpace(strings.TrimPrefix(line, "- PRIORITY:"))
 			if p, err := strconv.Atoi(v); err == nil {
@@ -181,11 +160,15 @@ func loadTask(rootPath, id string) (*task, error) {
 				}
 				t.tags = parts
 			}
+		case strings.HasPrefix(line, "~ "):
+			bodyLines = append(bodyLines, strings.TrimPrefix(line, "~ "))
+			inbody = true
 		}
 		// description lines are intentionally not read further; we stop
 		// caring about content once metadata is parsed since listTask
 		// doesn't need it.
 	}
+	t.description = strings.Join(bodyLines, "\n")
 
 	return t, scanner.Err()
 }
@@ -202,4 +185,14 @@ func getRootDir() (string, error) {
 
 	err = os.MkdirAll(root, 0755)
 	return root, err
+}
+
+func saveAll(tasks []*task) {
+	root, err := getRootDir()
+	if err != nil {
+		return
+	}
+	for _, t := range tasks {
+		t.save(root)
+	}
 }
